@@ -1,0 +1,17 @@
+# Build
+/target/
+
+# Local reverse-engineering artifacts (Windows installers, Wine prefix)
+/reference/
+/.wine/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Misc
+*.log
+/tmp/

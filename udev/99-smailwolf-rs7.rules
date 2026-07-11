@@ -1,0 +1,9 @@
+# Smailwolf RS7 / YJX-CHIP — allow hidraw access for config interface
+# Install:
+#   sudo cp udev/99-smailwolf-rs7.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+# Then unplug/replug the receiver (or reboot).
+
+KERNEL=="hidraw*", ATTRS{idVendor}=="a8a4", ATTRS{idProduct}=="2255", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="a8a5", ATTRS{idProduct}=="2255", MODE="0660", TAG+="uaccess"
