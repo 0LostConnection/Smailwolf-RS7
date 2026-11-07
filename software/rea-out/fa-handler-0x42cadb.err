@@ -1,0 +1,2 @@
+npm notice run npx
+npm notice run 'rea' decompile /home/lost/Projects/Smailwolf-RS7/software/mouse-RS7-1.2/DeviceDriver.exe 0x42cadb --provider ghidra --json
