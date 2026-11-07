@@ -2,7 +2,7 @@
 
 Engenharia reversa do software oficial Windows (`DeviceDriver.exe` / `YJXUI.dll`) via captura USB (`usbmon`) com o mouse no receptor 2.4G.
 
-Última atualização: 2026-07-11
+Última atualização: 2026-11-07
 
 ## Capacidades (UI oficial)
 
@@ -71,7 +71,37 @@ Ao clicar Apply no driver, a sequência observada é:
 | 10 | **`0x22`** | Confirma slot ativo + DPI desse slot |
 | 11 | **`0x23`** | Confirma polling |
 
-Os comandos `0x0D` / `0x10` / `0x09` ainda não foram totalmente decodificados; para reaplicar DPI/polling, o núcleo útil é **`0x0F` + `0x22` + `0x23`** (idealmente reproduzindo a sequência completa como o software faz).
+### Sequência Apply (DeviceDriver `FUN_004298c0` job 6)
+
+| # | CMD | Builder | Papel |
+|---|-----|---------|-------|
+| 1..N | **`0x0D`** | `FUN_0042ac40` | **Upload de macros gravadas** — blob fatiado em chunks de **`0x38` (56) bytes** (`size/0x38` + resto); buffer mínimo / só-header = **`0x40`** → sempre **2** chunks vazios nas capturas Apply |
+| N+1 | **`0x10`** | fim de `FUN_0042ac40` | commit/prep (`55 10 a5 …`) |
+| +5 | **`0x09`** | `FUN_0042b470` | mapas de botões ×5 (abaixo) |
+| +1 | **`0x0F`** | `FUN_0042ba10` | perfil DPI/RGB/flags |
+| +1 | **`0x22`** | `FUN_0042b6b0` | slot ativo |
+| +1 | **`0x23`** | `FUN_0042b8d0` | poll |
+
+**Framing `0x0D` (vazio, byte-exact nas capturas Apply):**
+
+| Chunk | Hex (prefixo) | Notas (`FUN_0042ac40`) |
+|-------|---------------|------------------------|
+| 0 | `55 0d 00 38 38 00…` | capacidade `0x38`; offset 0 |
+| 1 | `55 0d 00 40 08 38…` | total `0x40`; resto `0x40%0x38=8` no último chunk |
+
+Eventos `t_macrorecord.type` → blob (`FUN_0042ac40`); cada evento normal ocupa **4 bytes** no buffer (começa em offset `0x40`):
+
+| type | Encoding (resumo) |
+|------|-------------------|
+| 1 | Delay — avança cursor pelo `delay_time`; último evento OR `0x80` no byte+2 |
+| 2 | Key down — flags em +2 (`0x40` + bit1/bit2 para faixa scancode); scancode via `FUN_0043e570` em +3 |
+| 3 | Key up — similar sem `0x40` |
+| 4/5 | Mouse/scroll com valor; "Scroll Up/Down" → `0x0144` / `0xFF44` |
+| 6/7 | Scroll Up / Down fixos |
+| 8–0xB | Byte `0x46` + valor |
+| 0xC | `0x46` + nibbles empacotados; flags `0x40`/`0x80` em +1 |
+
+Binding no botão: `macro_type=0x70`, `value` = índice da macro. Captura Apply com macro **não-vazia** ainda útil para validar o payload após o header `0x40` (headers de chunk vazios já batem com o helper).
 
 ---
 
@@ -123,16 +153,88 @@ O TUI (`cargo run --release`) envia `0x0E` ao abrir o HID e preenche a UI com a 
 
 ---
 
-## Comando `0x0F` — perfil (DPI + poll)
+## Comandos `0x08` / `0x09` — mapa de botões (macros por tecla)
+
+GET = `0x08`, SET = `0x09`, tag `0xA5`. Layout idêntico (confirmado em `open-software-in-vm.pcapng` e nos Apply).
 
 ```
 Offset  Campo
 ------  -----
+0       magic (55 OUT / AA IN)
+1       cmd 0x08 GET / 0x09 SET
+2       tag 0xA5
+3       checksum = sum([4:64]) & 0xFF
+4       hdr 0x20
+5–6     0
+7       profile_index (GET 0..=5; Apply SET usa 0..=4)
+8+      9 × 4 bytes = (macro_type, value, value2, value3)
+```
+
+Defaults no fio (Apply / GET índices 0–4):
+
+| Botão | Bytes | Significado (UI 1033.lan) |
+|-------|-------|---------------------------|
+| 0 | `20 01 00 00` | Left-Click (`macro_type=0x20`, HID bit 1) |
+| 1 | `20 02 00 00` | Right-Click |
+| 2 | `20 04 00 00` | Middle-Click |
+| 3 | `20 08 00 00` | Backward |
+| 4 | `20 10 00 00` | Forward |
+| 5 | `21 55 00 00` | DPI Loop (`macro_type=0x21`) |
+| 6 | `21 38 01 00` | DPI + (`value2=0x01`) |
+| 7 | `21 38 ff 00` | DPI − (`value2=0xFF`) |
+| 8 | `00 00 00 00` | Disabled |
+
+`macro_type` (decoder `FUN_00411ce0` @ `0x411ce0`):
+
+| type | Papel |
+|------|-------|
+| `0x00` / `FF FF` | Disabled |
+| `0x10` | Keyboard (+ modifiers em `value2` bits Shift/Ctrl/Alt/Win) |
+| `0x20` | Mouse button (`value` = bit HID 1/2/4/8/16) |
+| `0x21` | Special (encoder `0x411866`): DPI± (`0x38`+`value2`), DPI Loop (`0x55`), AIM (`0xAA`), + `0x61`/`0x62` → UI types `0x0b`/`0x0c` (rótulos ausentes no `1033.lan`) |
+| `0x30` | Multimedia — `value` = HID Consumer Page: `0xB5` next, `0xB6` prev, `0xB7` stop, `0xCD` play/pause, `0xE2` mute, `0xE9`/`0xEA` vol± (`FUN_00411ce0`) |
+| `0x50` | Fire Key — `value` = parâmetro (cps/delay; UI id `0x1b`); AIM é `0x21`/`0xAA` |
+| `0x70` | Macro gravada — `value` = índice na lista `t_macro_data` |
+| `0xF0` | Atalhos (`value`=grupo, `value2`=1..3). **Grupo 1** = DPI +/−/Loop (lang 150–152). **Grupo 2** = Report Rate +/−/Loop (lang 153–155). Encoder @ `0x411932` / decode `FUN_00411ce0` |
+
+Keyboard (`0x10`): `value` = HID usage from Windows VK via `FUN_0043e570` (A–Z→`0x04`–`0x1d`, `1`–`0`→`0x1e`–`0x27`, F1–F12→`0x3a`–`0x45`, arrows→`0x4f`–`0x52`, modifiers→`0xe0`–`0xe7`, … — helper `vk_to_hid_usage`). `value2` modifier bits (`FUN_00411ce0`): `1` Ctrl, `2` Shift, `4` Alt, `8` Win.
+
+SQLite: `t_key_macro_data` (binding por botão) + `t_macro_data` / `t_macrorecord` (eventos gravados). O **binding** sobe no `0x09`; o upload da sequência gravada para o firmware ainda não foi isolado numa captura dedicada.
+
+O open prelude faz **`0x08`×6**; o índice 5 costuma voltar lixo/`acac…`. Apply reescreve **`0x09`×5**.
+
+---
+
+## Comando `0x0F` — perfil (DPI + RGB + flags + poll)
+
+```
+Offset  Campo
+------  -----
+9       light_mode
 10      poll_code
 11      num_stages (sempre 6 nas capturas)
 12      active_slot (1..6, 1-based)
-13+     6 × uint16 little-endian = DPI de cada slot
+13–24   6 × uint16 LE = DPI (`dpi_groupN_value`)
+25–42   6 × RGB (`dpi_groupN_rgb`, 3 bytes cada, ordem R,G,B)
+43      scroll_flag (0 = frente / Forward radio, 1 = invertido / Reverse — `FUN_0041b000`)
+44      liftoff_height (LOD; UI Low≈1 / High≈2)
+45      sensor_flag (wire; ver remap abaixo)
+46      button_respondtime (debounce)
+47      sleep_light
+48      e-sports_flag
+49–63   footer fixo `ff 01 0a ff ff 00…` — **igual** em GET `0x0E` e Apply `0x0F` (constante de firmware; TUI ecoa `PROFILE_FOOTER`)
 ```
+
+
+**`sensor_flag` remap** (`FUN_0042ba10` pack + `FUN_0041b2a0` checkboxes): o valor no SQLite não é igual ao byte no fio.
+
+| UI (1033.lan) | Bit SQLite | → wire |
+|---------------|------------|--------|
+| Ripple / Ripple Control | `0x04` | `0x10` |
+| Angle Snap | `0x08` | `0x01` |
+| Motion Sync | `0x10` | `0x20` |
+
+“Sensor Linearity” (string `573`) é só título/chrome da seção — **não** é um bit. Os três toggles reais escrevem DB `0x04|0x08|0x10` e o Apply remapeia para o byte `[45]` do `0x0F`.
 
 ### Exemplo (slot 1 = 1600, poll 500 Hz)
 
@@ -230,43 +332,46 @@ Exemplos: `03` = 500 Hz, `04` = 1000 Hz, `02` = 250 Hz.
 
 ## Comando `0xFA` (device → host) — multiplexado
 
-O device envia reports **não solicitados** no EP `0x83` — **não há OUT** pedindo. O **mesmo CMD `0xFA`** carrega dois layouts distintos; discrimine pelo byte `[8]` (ou `[4]`).
+O device envia reports **não solicitados** no EP `0x83` — **não há OUT** pedindo. O **mesmo CMD `0xFA`** carrega vários layouts; discrimine **somente** pelo marker `[8]` (não pelo header `[4]`).
 
-| Variante | `[4]` | `[8]` | `[9]` | `[10]` |
-|----------|-------|-------|-------|--------|
-| **Bateria** | `0x38` | `0xD0` | percent 0–100 | FLAGS (0 = não carregando) |
-| **Stage/slot ativo** | `0x0A` | `0x10` | `active_slot` 1–6 | `poll_code` |
+Confirmado no driver oficial `DeviceDriver.exe` (dispatch em VA `0x42cadb`, build 1.2 / SHA-256 `a7064d35…119df`) e UI `YJXUI.dll!BatteryCtrl::SetBatteryInfo(int,int)` @ `0x1001fe50`.
 
-### Bateria (`… 38 … d0 PCT FLAGS`)
+| Variante | Marker `[8]` | `[9]` | `[10]` | Ação no driver |
+|----------|--------------|-------|--------|----------------|
+| **Notify** | `0x50` / `0x60` | código de status | — | **não** é bateria |
+| **Bateria** | `0xD0` | percent (clamp ≤100) | FLAGS | `SetBatteryInfo(pct, flags)` |
+| **Stage/slot** | `0x10` | `active_slot` 1–6 | `poll_code` | atualiza `dpi_index` + `report_rate` |
+| **Light** | `0x11` | `light_mode` (clamp ≤6) | — | grava `light_mode` |
 
-O software mostra ícone de bateria no modo 2.4G (`BatteryCtrl` / `SetBatteryInfo(int, int)` no `YJXUI.dll`).
+O driver ainda exige magic `0xAA` + cmd `0xFA` e aplica um throttle de ~200 ms entre processamentos FA.
+
+### Bateria (`… d0 PCT FLAGS`)
 
 ```
 aa fa ae CKSUM 38 01 01 01 d0 PCT FLAGS 00...
-│  │  │  │     │           │  │   └─ 0 = em uso (não carregando)
-│  │  │  │     │           │  └─ percent 0–100
-│  │  │  │     │           └─ marker 0xD0
-│  │  │  │     └─ header fixo observado (38 01 01 01)
+│  │  │  │     │           │  │   └─ 0 = em uso; ≠0 ≈ carregando (candidato)
+│  │  │  │     │           │  └─ percent 0–100 (driver: min(raw, 100))
+│  │  │  │     │           └─ marker 0xD0  ← critério oficial
+│  │  │  │     └─ header frequente 0x38 (NÃO usar sozinho como discriminante)
 │  │  │  └─ checksum = sum([4:64]) & 0xFF
 │  │  └─ tag 0xAE
 │  └─ cmd 0xFA
 └─ magic IN
 ```
 
-Confirmado em `captures/idle-turn-on-on-receiver-mode.pcapng` (UI “cheia” ≈ ~80%+):
+Confirmado em `captures/idle-turn-on-on-receiver-mode.pcapng` e `open-software-in-vm.pcapng`:
 
-| t (s) | Payload (início) | PCT | FLAGS |
-|-------|------------------|-----|-------|
-| 8.484 | `aa fa ae 5b … d0 50 00` | **80** | 0 |
-| 9.234 | `aa fa ae 5c … d0 51 00` | **81** | 0 |
+| Payload (início) | PCT | FLAGS |
+|------------------|-----|-------|
+| `aa fa ae 5b … d0 50 00` | **80** | 0 |
+| `aa fa ae 5c … d0 51 00` | **81** | 0 |
+| `… d0 48 01` (`dpi-2400`) | **72** | 1 (charging?) |
 
-Outros (`captures/dpi-2400.pcapng`): `d0 50 00` (80), `d0 48 00` (72), `d0 48 01` (72, FLAGS=1 candidato a charging).
+Capturas também mostram jitter FA **80↔81**. O UI filtra com o mesmo throttle ~200 ms do driver, prioriza FA `0xD0` sobre GET `0x30`, e exige confirmação para oscilação de ±1%.
 
-Captura com mouse **carregando** ainda é útil para cravar `FLAGS`.
+**Bug clássico (TUI antiga):** tratar `header==0x38` **ou** qualquer `0xFA` como bateria. Markers `0x50`/`0x60` (notify) e `0x10` (slot) então viram “porcentagem” falsa (1%…6% = slot, ou códigos de notify).
 
-### Stage ativo — botão DPI (`… 0a … 10 SLOT POLL`)
-
-Ao ciclar o botão DPI no mouse, o firmware notifica o stage atual **no mesmo CMD `0xFA`**, sem Apply do host:
+### Stage ativo — botão DPI (`… 10 SLOT POLL`)
 
 ```
 aa fa ae CKSUM 0a 01 01 01 10 SLOT POLL 00...
@@ -276,7 +381,7 @@ aa fa ae CKSUM 0a 01 01 01 10 SLOT POLL 00...
 │                    └─ header 0x0A
 ```
 
-Exemplos observados (strace no `rs7-tui` enquanto ciclava o botão):
+Exemplos (strace / botão DPI):
 
 | Payload (início) | Slot | poll_code |
 |------------------|------|-----------|
@@ -284,29 +389,40 @@ Exemplos observados (strace no `rs7-tui` enquanto ciclava o botão):
 | `aa fa ae 22 … 10 02 03` | 2 | 3 |
 | `aa fa ae 26 … 10 06 03` | 6 | 3 |
 
-**Bug clássico:** tratar todo `0xFA` como bateria faz o indicador mostrar `1%`…`6%` (o slot) e a UI não atualizar o nível ativo.
-
 ### Power-on no receptor (mesma captura idle)
 
 Ao emparelhar/ligar em 2.4G, ordem observada:
 
 | CMD | Papel |
 |-----|--------|
-| `0xE6` | Identidade/serial (ASCII: `ID`, `S5E98=5E98`, `B-66`, …) |
-| `0xED` | Status de link / sessão |
+| `0xE6` | Serial TLV-ish: após hdr, campos ASCII separados por `00` (`ID`, `S5E98=5E98`, `B-66`, …) |
+| `0xED` | Link/sessão — tag `AE`; `[8]` observado `01`/`02` entre estados |
 | `0xFA` | Bateria (logo em seguida, ~0.6–0.7 s) |
+| `0x03` | Ident (open): ASCII desde `[8]` — `YJX.co.mouse…` + datas de build |
 
 ---
 
 ## Software oficial (referência)
 
-Instalador/app Windows em `reference/` (local, gitignored):
+Cópia analisada em `software/mouse-RS7-1.2/` (versão **1.2.2** no `config.xml`; projeto Ghidra local `software/RS7.gpr`):
 
-- `DeviceDriver.exe` — usa `HidD_SetFeature` / `WriteFile` + SetupAPI
-- `YJXUI.dll` — UI
+- `DeviceDriver.exe` — protocolo HID (`HidD_*` / `WriteFile`); defaults embutidos (`report_rate=3`, `dpi_group0..5_value`, `scroll_flag`, `liftoff_height`, `light_mode`, …)
+- `YJXUI.dll` — UI (`BatteryCtrl::SetBatteryInfo`, `DPIControl`, …)
 - `config.xml` — VID/PID e `MI_02`
 
-IDs internos observados nas strings: `dpi_groupN_value`, `dpi_index`, `report_rate`, `liftoff_height`, `light_mode`, etc. (RGB / LOD / macros ainda não mapeados no fio).
+### Sequência de abertura (oficial)
+
+De `captures/open-software-in-vm.pcapng`:
+
+`0x30` → `0x08`×6 → **`0x0E`** (perfil) → `0x03` (ident; resposta ASCII tipo `YJX.co.m`)
+
+A bateria `0xFA`/`0xD0` já aparece **antes** desses GETs (não solicitada). O TUI agora espelha o prelude + GET `0x0E`.
+
+### GET `0x30` — info / bateria solicitada
+
+Pedido (tag `A5`, hdr `0x2E`): `55 30 a5 2e 2e …`
+
+Resposta observada: `aa 30 a5 2e 0a 00 00 00 **50** 00 …` — DeviceDriver trata `[8]`/`[9]` como `SetBatteryInfo(percent, flags)` (`FUN_0042a1d0` / `FUN_0042c720`). Aqui `0x50` = 80%, alinhado às FA `0xD0` do mesmo boot. Ou seja, **`0x30` também lê bateria** (além de “info”); byte `[4]=0x0A` ainda sem mapa completo.
 
 ## Como capturar (resumo)
 
@@ -327,14 +443,25 @@ IDs internos observados nas strings: `dpi_groupN_value`, `dpi_index`, `report_ra
 | **Ler perfil (`0x0E` GET)** | **Confirmado** (`captures/open-software-in-vm.pcapng`) — mesmo layout do `0x0F` |
 | Report rate 250/500/1000 | Confirmado no fio |
 | Report rate 125 | Na UI; captura `poll_code=1` pendente |
-| Bateria (`0xFA` + marker `0xD0`) | **Confirmado** percent em `[9]`; `FLAGS` charging ainda candidato |
+| Bateria (`0xFA` + marker `0xD0`) | **Confirmado** (2.4G unsolicited); GET **`0x30`** `[8]`/`[9]` também alimenta `SetBatteryInfo` (poll sob demanda — candidato a cabo) |
+| Notify FA (`0x50`/`0x60`) | **Confirmado** no driver — **não** é bateria |
+| Light mode FA (`0x11`) + perfil `[9]` | **Confirmado**; TUI edita `light_mode` 0..=6 |
 | Stage ativo via botão DPI (`0xFA` + marker `0x10`) | **Confirmado** slot em `[9]`, poll_code em `[10]` |
+| Open prelude `0x30`/`0x08`/`0x03` | **Confirmado** (`open-software-in-vm.pcapng`) |
 | Checksum `0x0F/22/23` (+ `0xFA`) / GET `0xA5` | Confirmado |
-| Scroll direction | Na UI; protocolo pendente |
-| RGB / lighting | Pendente |
-| Remapeamento de botões / macros | Pendente |
-| LOD / angle / debounce | Pendente |
-| Modo cabo (`a8a4`) | Mesma interface esperada; não validado nas capturas |
+| Scroll direction (`scroll_flag` @ `[43]`) | **Confirmado** no `0x0F` + TUI |
+| RGB por slot DPI (`dpi_groupN_rgb` @ `[25..]`) | **Confirmado** no `0x0F` / Apply; GET `0x0E` muitas vezes zera RGB |
+| Light mode no perfil (`[9]` + FA `0x11`) | **Confirmado** |
+| Remapeamento de botões (`0x08`/`0x09`, 9×4) | **Confirmado** + tabela `macro_type` (`FUN_00411ce0`) |
+| Macro gravada | Binding `0x70` no `0x09` + upload blob via **`0x0D` chunks** (`FUN_0042ac40`) **confirmados**; layout interno do blob precisa captura com macro real |
+| Light FX (brightness/speed/direction) | Só `light_mode` no `0x0F`/`FA 0x11`; params ricos ficam no SQLite `t_light_data` — wire dedicado **pendente** |
+| LOD (`liftoff_height` @ `[44]`) | **Confirmado** no perfil |
+| `sensor_flag` (Ripple / Angle Snap / Motion Sync) | **Confirmado** DB↔wire + UI checkboxes (`FUN_0041b2a0`/`FUN_0042ba10`); TUI edita os 3 bits no `[45]` |
+| debounce (`button_respondtime`) | Byte `[46]` no `0x0F`; UI “Debounce Time” (valor livre → atoi); capturas default `0`; TUI 0..=20 |
+| e-sports (`e-sports_flag`) | Byte `[48]`; radio On (`FUN_0041b150`) grava SQLite `"2"` / Off `"1"` → atoi no fio; GET/Apply de fábrica ainda `0`. TUI cicla 0/1/2. Branch firmware `device_rev < 0xC9` altera paths Apply |
+| `sleep_light` | Byte `[47]`; UI “SleepTime” / “Not Sleep”; default SQLite `20` |
+| `leftbtn_lock` | Só SQLite/XML (host UI lock); **não** aparece no builder `0x0F` |
+| Modo cabo (`a8a4`) | Mesma MI_02/`0xFF01`; com cabo+dongle plugados, preferir `a8a4` e exigir resposta GET `0x0E` (dongle ocioso não responde) |
 
 ## Arquivos de captura
 

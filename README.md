@@ -1,65 +1,65 @@
 # Smailwolf RS7
 
-TUI Linux para configurar o mouse **Smailwolf RS7** (chip YJX), com o protocolo HID documentado em [`PROTOCOL.md`](PROTOCOL.md).
+TUI + GUI Linux tools to configure the **Smailwolf RS7** mouse (YJX chip). Protocol notes live in [`PROTOCOL.md`](PROTOCOL.md).
 
-Não há suporte em Piper / libratbag / OpenRGB ainda.
+No Piper / libratbag / OpenRGB support yet.
 
-## O que faz
+## What it does
 
-- Detecta cabo (`a8a4:2255`) ou receptor 2.4G (`a8a5:2255`) na **interface MI_02**
-- Ao abrir, **lê o perfil atual** com GET `0x0E` (DPI / poll / slot ativo)
-- Mostra bateria e troca de slot via `0xFA` não solicitado
-- Edita 6 slots de DPI (200–24000), slot ativo e report rate (125/250/500/1000 Hz)
-- **Ctrl+S** aplica a sequência do software oficial: `0x0D`×2 → `0x10` → `0x09`×5 → `0x0F` → `0x22` → `0x23`
+- Detects cable (`a8a4:2255`) or 2.4G receiver (`a8a5:2255`) on **MI_02**
+- On open, mirrors the official software prelude (`0x30` / `0x08`×6 / GET `0x0E` / `0x03`)
+- Shows battery (FA marker **`0xD0`**) and hardware slot changes (marker `0x10`)
+- Edits 6 DPI slots (200–24000), active slot, report rate, scroll/LOD/sensor/e-sports, button 5 cycle
+- Apply sends the official sequence: `0x0D`×2 → `0x10` → `0x09`×5 → `0x0F` → `0x22` → `0x23`
+- UI languages: **pt_BR** and **en_US** (TUI: `l` · GUI: language button)
 
-## Aviso
+## Warning
 
-**Não envie pacotes HID aleatórios.** Só templates observados em captura, com checksum correto. Spam inventado pode corromper o perfil — tenha o driver Windows à mão se precisar resetar.
+**Do not send random HID packets.** Only observed templates with a correct checksum. Invented spam can corrupt the profile — keep the Windows driver handy if you need a reset.
 
 ## Build / run
 
 ```bash
-# udev (obrigatório)
+# udev (required)
 sudo cp udev/99-smailwolf-rs7.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-# replug o dongle; mouse NÃO pode estar em passthrough na VM
+# replug the dongle; mouse must NOT be passed through to a VM
 
 cargo test
-cargo run --release
-# binário: target/release/rs7-tui
+cargo run -p rs7-tui --release   # terminal UI → target/release/rs7-tui
+cargo run -p rs7-gui --release   # GPUI desktop → target/release/rs7-gui
 ```
 
-## Atalhos
+## TUI shortcuts
 
-| Tecla | Ação |
-|-------|------|
-| `Tab` / `↑` `↓` | Navegar |
-| `←` `→` | Ajustar valor focado |
-| `Enter` | Editar DPI / focar Aplicar |
-| **`Ctrl+S`** | **Salvar / aplicar no mouse** |
-| `r` | Reler perfil (`0x0E`) |
+| Key | Action |
+|-----|--------|
+| `Tab` / `↑` `↓` | Navigate |
+| `←` `→` | Adjust focused value |
+| `Enter` | Edit DPI / activate |
+| **`Ctrl+S`** | **Apply profile to mouse** |
+| `r` | Refresh profile (`0x0E`) |
 | `+` `-` | DPI ±100 |
-| `[` `]` | DPI ±50 |
-| `q` / `Esc` | Sair |
+| `[` `]` `{` `}` `,` `.` | RGB ±16 |
+| `b` | Cycle button 5 |
+| `l` | Toggle pt_BR / en_US |
+| `q` / `Esc` | Quit |
 
-## Layout do repo
+## Layout
 
-| Path | Conteúdo |
+| Path | Contents |
 |------|----------|
-| `src/` | TUI (`protocol`, `device`, `ui`) |
-| `udev/` | Regra hidraw |
-| `PROTOCOL.md` | Mapa do protocolo YJX |
-| `captures/` | usbmon / pcapng da engenharia reversa |
-| `docs/` | Screenshot da UI oficial |
-| `HANDOFF.md` | Contexto para continuar o trabalho |
-| `reference/` | *(local, gitignored)* instalador Windows / app extraído |
+| `crates/rs7-core/` | Shared protocol, HID worker, i18n, profile helpers |
+| `crates/rs7-tui/` | Ratatui terminal UI |
+| `crates/rs7-gui/` | GPUI Kit desktop UI |
+| `udev/` | hidraw udev rule |
+| `PROTOCOL.md` | YJX protocol map |
+| `captures/` | usbmon / pcapng from RE |
+| `docs/` | Official UI screenshot |
+| `HANDOFF.md` | Continuity notes |
+| `software/mouse-RS7-1.2/` | Official Windows app |
+| `software/RS7.gpr` | Local Ghidra project |
 
-## Nota técnica (Linux)
+## Linux note
 
-Writes HID usam prefixo **Report ID `0x00`** + 64 bytes. Sem isso o kernel trata `0x55` como Report ID e o Apply “passa” sem efeito.
-
-## Limitações
-
-- RGB, macros, LOD, scroll reverse: ainda não mapeados
-- `FLAGS` de carga em `0xFA`: candidato (falta captura carregando)
-- Report rate 125 Hz: na UI; captura `poll_code=1` pendente
+HID writes use report ID prefix **`0x00`** + 64 bytes. Without it the kernel treats `0x55` as the report ID and Apply appears to succeed with no effect.
