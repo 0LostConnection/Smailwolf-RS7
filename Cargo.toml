@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rs7-core",
     "crates/rs7-tui",
+    "crates/rs7-gui",
 ]
 # makepkg clones into packaging/aur/*/src — keep that tree out of this workspace
 exclude = ["packaging"]
@@ -20,3 +21,5 @@ hidapi = "2.6.6"
 ratatui = "0.30.2"
 thiserror = "2.0.18"
 pretty_assertions = "1.4.1"
+gpui-kit = "0.9.0"
+anyhow = "1"

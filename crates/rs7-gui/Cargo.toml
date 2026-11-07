@@ -1,0 +1,17 @@
+[package]
+name = "rs7-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPUI desktop configurator for Smailwolf RS7"
+readme = "../../README.md"
+
+[[bin]]
+name = "rs7-gui"
+path = "src/main.rs"
+
+[dependencies]
+rs7-core = { workspace = true }
+gpui-kit = { workspace = true }
+anyhow = { workspace = true }
+smol = "2"
