@@ -1,6 +1,23 @@
 # Build
 /target/
 
+# Knowledge-graph cache (regenerated locally)
+/graphify-out/
+
+# AUR makepkg workdirs (when built from packaging/aur/* inside this tree)
+packaging/aur/*/src/
+packaging/aur/*/pkg/
+packaging/aur/*/.cargo/
+packaging/aur/*/target/
+packaging/aur/*/*.pkg.tar*
+packaging/aur/*/Smailwolf-RS7/
+
+# Proprietary Windows driver install (keep local for RE; not redistributed)
+/software/mouse-RS7-1.2/
+/software/*.gpr
+/software/*.rep
+/software/*.lock*
+
 # Local reverse-engineering artifacts (Windows installers, Wine prefix)
 /reference/
 /.wine/
