@@ -1,0 +1,81 @@
+# Maintainer: Lost Connection <0LostConnection@users.noreply.github.com>
+pkgname=smailwolf-rs7-git
+_pkgname=Smailwolf-RS7
+pkgver=0.r1.g4f279d0
+pkgrel=1
+pkgdesc='Linux TUI/GUI configurator for the Smailwolf RS7 mouse (YJX HID)'
+arch=('x86_64')
+url='https://github.com/0LostConnection/Smailwolf-RS7'
+license=('MIT')
+depends=(
+  'fontconfig'
+  'freetype2'
+  'libegl'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'libxcb'
+  'systemd-libs'
+  'vulkan-icd-loader'
+  'wayland'
+)
+makedepends=('cargo' 'clang' 'git' 'rust')
+provides=('smailwolf-rs7')
+conflicts=('smailwolf-rs7')
+install=smailwolf-rs7.install
+source=("git+${url}.git")
+sha256sums=('SKIP')
+options=('!lto')
+
+pkgver() {
+  cd "$_pkgname"
+  local _cargo
+  _cargo="$(awk '
+    /^\[workspace\.package\]/ { in_pkg = 1; next }
+    /^\[/ { in_pkg = 0 }
+    in_pkg && /^version = / {
+      gsub(/"/, "", $3)
+      print $3
+      exit
+    }
+  ' Cargo.toml)"
+  printf "%s.r%s.g%s" "${_cargo:-0}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$srcdir/$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  # When this AUR dir lives inside a checkout of the same repo, Cargo would
+  # otherwise walk up into the outer workspace. Root Cargo.toml excludes
+  # `packaging/`; keep CARGO_HOME local so fetches stay under $srcdir.
+  export CARGO_HOME="${CARGO_HOME:-$srcdir/.cargo}"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$srcdir/$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_HOME="${CARGO_HOME:-$srcdir/.cargo}"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --frozen --release -p rs7-gui -p rs7-tui
+}
+
+package() {
+  cd "$srcdir/$_pkgname"
+
+  install -Dm755 "$srcdir/target/release/rs7-gui" "$pkgdir/usr/bin/rs7-gui"
+  install -Dm755 "$srcdir/target/release/rs7-tui" "$pkgdir/usr/bin/rs7-tui"
+
+  install -Dm644 packaging/smailwolf-rs7.desktop \
+    "$pkgdir/usr/share/applications/smailwolf-rs7.desktop"
+
+  install -Dm644 udev/99-smailwolf-rs7.rules \
+    "$pkgdir/usr/lib/udev/rules.d/99-smailwolf-rs7.rules"
+
+  local size
+  for size in 16 24 32 48 64 128 256; do
+    install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/smailwolf-rs7.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/smailwolf-rs7.png"
+  done
+
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+}

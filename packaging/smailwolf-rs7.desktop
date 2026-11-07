@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Smailwolf RS7
+GenericName=Mouse configurator
+Comment=Configure the Smailwolf RS7 mouse (YJX HID)
+Exec=rs7-gui
+Icon=smailwolf-rs7
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=mouse;dpi;hid;rs7;smailwolf;yjx;
+StartupNotify=true

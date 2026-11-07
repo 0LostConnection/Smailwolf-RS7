@@ -1,0 +1,11 @@
+post_install() {
+  if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules
+    udevadm trigger
+  fi
+  echo 'Replug the Smailwolf RS7 cable or 2.4G receiver so the hidraw udev rule applies.'
+}
+
+post_upgrade() {
+  post_install
+}
