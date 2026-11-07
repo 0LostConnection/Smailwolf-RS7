@@ -1,9 +1,11 @@
 //! HID device access for Smailwolf RS7 config interface (MI_02).
 
+use crate::i18n::{t, Locale, Msg};
 use crate::protocol::{
-    self, build_apply_sequence, build_get_profile_packet, parse_inbound, ConnectionMode,
-    DeviceEvent, Profile, Report, PID, CONFIG_INTERFACE, USAGE_PAGE_VENDOR, VID_RECEIVER,
-    VID_WIRED, CMD_GET_PROFILE, MAGIC_IN,
+    self, build_apply_sequence, build_get_info_packet, build_get_profile_packet,
+    build_open_prelude, parse_inbound, ConnectionMode, DeviceEvent, Profile, Report, PID,
+    CONFIG_INTERFACE, USAGE_PAGE_VENDOR, VID_RECEIVER, VID_WIRED, CMD_GET_INFO, CMD_GET_PROFILE,
+    MAGIC_IN,
 };
 use hidapi::{HidApi, HidDevice};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -30,6 +32,17 @@ pub enum DeviceError {
 }
 
 impl DeviceError {
+    pub fn message(&self, locale: Locale) -> String {
+        match self {
+            Self::NotFound => t(Msg::DeviceNotFound, locale).to_string(),
+            Self::PermissionDenied => t(Msg::PermissionDenied, locale).to_string(),
+            Self::Busy => t(Msg::DeviceBusy, locale).to_string(),
+            Self::Hid(s) => format!("{}: {s}", t(Msg::HidError, locale)),
+            Self::WriteFailed => t(Msg::WriteFailed, locale).to_string(),
+            Self::Disconnected => t(Msg::Disconnected, locale).to_string(),
+        }
+    }
+
     fn from_open(err: hidapi::HidError) -> Self {
         let msg = err.to_string().to_lowercase();
         if msg.contains("permission") || msg.contains("access denied") || msg.contains("eacces") {
@@ -63,6 +76,8 @@ pub enum HostToDevice {
 
 pub enum DeviceToHost {
     Opened(DeviceInfo),
+    /// Config interface gone / switching — UI should clear "online".
+    Disconnected,
     /// Current on-device profile (after open or Refresh).
     Profile(Profile),
     Event(DeviceEvent),
@@ -122,30 +137,52 @@ impl Drop for DeviceWorker {
     }
 }
 
+/// How often to rescan USB for cable↔dongle while a config iface is open.
+const REPROBE_EVERY: Duration = Duration::from_millis(1500);
+
 fn worker_loop(cmd_rx: Receiver<HostToDevice>, evt_tx: Sender<DeviceToHost>) -> Result<(), DeviceError> {
     let mut api = HidApi::new().map_err(|e| DeviceError::Hid(e.to_string()))?;
     let mut device: Option<HidDevice> = None;
+    let mut current_info: Option<DeviceInfo> = None;
     let mut buf = [0u8; protocol::REPORT_SIZE + 1];
     let mut need_profile_load = false;
+    let mut last_reprobe = std::time::Instant::now()
+        .checked_sub(REPROBE_EVERY)
+        .unwrap_or_else(std::time::Instant::now);
 
     loop {
         // (Re)open config interface if needed.
         if device.is_none() {
-            match try_open_config(&mut api) {
-                Ok((info, dev)) => {
+            match try_open_responding_config(&mut api, &evt_tx) {
+                Ok((info, dev, profile)) => {
+                    current_info = Some(info.clone());
                     let _ = evt_tx.send(DeviceToHost::Opened(info));
-                    let _ = dev.set_blocking_mode(false);
+                    let _ = evt_tx.send(DeviceToHost::Profile(profile));
                     device = Some(dev);
-                    need_profile_load = true;
+                    need_profile_load = false;
+                    last_reprobe = std::time::Instant::now();
                 }
                 Err(err) => {
                     let _ = evt_tx.send(DeviceToHost::Status(err.to_string()));
                 }
             }
+        } else if last_reprobe.elapsed() >= REPROBE_EVERY {
+            last_reprobe = std::time::Instant::now();
+            match reprobe_connection(&mut api, &mut device, &mut current_info, &evt_tx) {
+                Reprobe::Switched => need_profile_load = false,
+                Reprobe::Dropped => {
+                    need_profile_load = false;
+                    let _ = evt_tx.send(DeviceToHost::Disconnected);
+                }
+                Reprobe::Unchanged => {}
+            }
         }
 
         if need_profile_load {
+            // Refresh asked for a re-read on the already-open handle. If it fails,
+            // drop and re-probe (covers cable↔dongle swaps).
             if let Some(dev) = device.as_ref() {
+                let _ = send_open_prelude(dev, &evt_tx);
                 match send_get_profile(dev, &evt_tx) {
                     Ok(profile) => {
                         let _ = evt_tx.send(DeviceToHost::Profile(profile));
@@ -155,17 +192,9 @@ fn worker_loop(cmd_rx: Receiver<HostToDevice>, evt_tx: Sender<DeviceToHost>) -> 
                         let _ = evt_tx.send(DeviceToHost::Status(format!(
                             "falha ao ler perfil do mouse: {err}"
                         )));
-                        // Retry on next loop after a short pause; don't hammer.
                         thread::sleep(Duration::from_millis(300));
-                        if matches!(
-                            err,
-                            DeviceError::Busy
-                                | DeviceError::PermissionDenied
-                                | DeviceError::WriteFailed
-                        ) {
-                            device = None;
-                            need_profile_load = false;
-                        }
+                        drop_connection(&mut device, &mut current_info, &evt_tx);
+                        need_profile_load = false;
                     }
                 }
             }
@@ -184,8 +213,7 @@ fn worker_loop(cmd_rx: Receiver<HostToDevice>, evt_tx: Sender<DeviceToHost>) -> 
                     let msg = err.to_string().to_lowercase();
                     if !(msg.contains("timeout") || msg.contains("timed out")) {
                         let _ = evt_tx.send(DeviceToHost::Status(format!("leitura HID: {err}")));
-                        // Force reopen on hard read errors.
-                        device = None;
+                        drop_connection(&mut device, &mut current_info, &evt_tx);
                     }
                 }
             }
@@ -213,8 +241,13 @@ fn worker_loop(cmd_rx: Receiver<HostToDevice>, evt_tx: Sender<DeviceToHost>) -> 
                     Err(err) => {
                         let _ = evt_tx.send(DeviceToHost::ApplyErr(err.to_string()));
                         // Re-open next loop if the handle went bad.
-                        if matches!(err, DeviceError::Busy | DeviceError::PermissionDenied | DeviceError::WriteFailed) {
-                            device = None;
+                        if matches!(
+                            err,
+                            DeviceError::Busy
+                                | DeviceError::PermissionDenied
+                                | DeviceError::WriteFailed
+                        ) {
+                            drop_connection(&mut device, &mut current_info, &evt_tx);
                         }
                     }
                 }
@@ -225,47 +258,187 @@ fn worker_loop(cmd_rx: Receiver<HostToDevice>, evt_tx: Sender<DeviceToHost>) -> 
     }
 }
 
-fn try_open_config(api: &mut HidApi) -> Result<(DeviceInfo, HidDevice), DeviceError> {
-    let _ = api.refresh_devices();
-    let info = find_config_device(api)?;
-    let device = open_by_path(api, &info.path)?;
-    Ok((info, device))
+enum Reprobe {
+    Unchanged,
+    Switched,
+    Dropped,
 }
 
-fn find_config_device(api: &HidApi) -> Result<DeviceInfo, DeviceError> {
-    // Refresh enumeration in case the device appeared after start.
-    // HidApi::new already enumerated; re-create for a fresh list if needed.
-    let mut candidates: Vec<_> = api
-        .device_list()
-        .filter(|d| {
-            let vid = d.vendor_id();
-            let pid = d.product_id();
-            pid == PID && (vid == VID_WIRED || vid == VID_RECEIVER)
-        })
-        .collect();
+fn drop_connection(
+    device: &mut Option<HidDevice>,
+    current_info: &mut Option<DeviceInfo>,
+    evt_tx: &Sender<DeviceToHost>,
+) {
+    if device.is_some() || current_info.is_some() {
+        *device = None;
+        *current_info = None;
+        let _ = evt_tx.send(DeviceToHost::Disconnected);
+    }
+}
 
+/// Prefer wired when it answers GET `0x0E`; otherwise keep/use the receiver.
+///
+/// With both USB ends plugged, the idle path still shows MI_02 but will not
+/// return a profile — so we only switch when the preferred candidate answers.
+fn reprobe_connection(
+    api: &mut HidApi,
+    device: &mut Option<HidDevice>,
+    current_info: &mut Option<DeviceInfo>,
+    evt_tx: &Sender<DeviceToHost>,
+) -> Reprobe {
+    let _ = api.refresh_devices();
+    let candidates = list_config_candidates(api);
+    let Some(cur) = current_info.clone() else {
+        *device = None;
+        return Reprobe::Dropped;
+    };
+
+    let still_present = candidates.iter().any(|c| c.path == cur.path);
+    if !still_present {
+        let _ = evt_tx.send(DeviceToHost::Status(format!(
+            "{} sumiu — procurando de novo…",
+            match cur.mode {
+                ConnectionMode::Wired => "cabo",
+                ConnectionMode::Receiver24G => "receptor",
+            }
+        )));
+        *device = None;
+        *current_info = None;
+        return Reprobe::Dropped;
+    }
+
+    let Some(preferred) = candidates.first() else {
+        *device = None;
+        *current_info = None;
+        return Reprobe::Dropped;
+    };
+
+    // Higher-priority interface appeared (usually cable while on dongle).
+    if preferred.path != cur.path {
+        match try_open_candidate(api, preferred, evt_tx) {
+            Ok((info, dev, profile)) => {
+                let _ = evt_tx.send(DeviceToHost::Status(format!(
+                    "trocou para {} — {}",
+                    match info.mode {
+                        ConnectionMode::Wired => "cabo",
+                        ConnectionMode::Receiver24G => "receptor",
+                    },
+                    info.product
+                )));
+                *current_info = Some(info.clone());
+                *device = Some(dev);
+                let _ = evt_tx.send(DeviceToHost::Opened(info));
+                let _ = evt_tx.send(DeviceToHost::Profile(profile));
+                return Reprobe::Switched;
+            }
+            Err(_) => {
+                // Preferred is enumerated but not answering yet (mid-plug). Keep
+                // the current link; the next reprobe retries.
+            }
+        }
+    } else if cur.mode == ConnectionMode::Wired {
+        // Cable rarely emits FA 0xD0; re-seed battery via GET 0x30 (official path).
+        if let Some(dev) = device.as_ref() {
+            let _ = poll_battery_info(dev, evt_tx);
+        }
+    }
+
+    Reprobe::Unchanged
+}
+
+fn poll_battery_info(
+    device: &HidDevice,
+    evt_tx: &Sender<DeviceToHost>,
+) -> Result<(), DeviceError> {
+    let pkt = build_get_info_packet();
+    write_report(device, &pkt)?;
+    let _ = wait_for_cmd(device, CMD_GET_INFO, Duration::from_millis(250), Some(evt_tx))?;
+    Ok(())
+}
+
+/// Open the first config interface that answers GET `0x0E`.
+///
+/// Wired (`a8a4`) is tried before the 2.4G receiver (`a8a5`). With both USB
+/// devices plugged, the idle dongle still exposes MI_02 but will not return a
+/// profile while the mouse is on cable — so open alone is not enough.
+fn try_open_responding_config(
+    api: &mut HidApi,
+    evt_tx: &Sender<DeviceToHost>,
+) -> Result<(DeviceInfo, HidDevice, Profile), DeviceError> {
+    let _ = api.refresh_devices();
+    let candidates = list_config_candidates(api);
     if candidates.is_empty() {
         return Err(DeviceError::NotFound);
     }
 
-    // Prefer MI_02 / vendor usage page.
-    candidates.sort_by_key(|d| {
+    let mut last_err = DeviceError::NotFound;
+    for info in candidates {
+        match try_open_candidate(api, &info, evt_tx) {
+            Ok(opened) => return Ok(opened),
+            Err(err) => {
+                let _ = evt_tx.send(DeviceToHost::Status(format!(
+                    "{} ({}): {err}",
+                    match info.mode {
+                        ConnectionMode::Wired => "cabo",
+                        ConnectionMode::Receiver24G => "receptor",
+                    },
+                    info.path
+                )));
+                last_err = err;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn try_open_candidate(
+    api: &HidApi,
+    info: &DeviceInfo,
+    evt_tx: &Sender<DeviceToHost>,
+) -> Result<(DeviceInfo, HidDevice, Profile), DeviceError> {
+    let device = open_by_path(api, &info.path)?;
+    let _ = device.set_blocking_mode(false);
+    let _ = send_open_prelude(&device, evt_tx);
+    let profile = send_get_profile(&device, evt_tx)?;
+    Ok((info.clone(), device, profile))
+}
+
+/// Unique MI_02 / vendor-page config interfaces, wired first then receiver.
+fn list_config_candidates(api: &HidApi) -> Vec<DeviceInfo> {
+    let mut candidates: Vec<DeviceInfo> = Vec::new();
+    for d in api.device_list() {
+        let vid = d.vendor_id();
+        let pid = d.product_id();
+        if pid != PID || (vid != VID_WIRED && vid != VID_RECEIVER) {
+            continue;
+        }
         let iface_ok = d.interface_number() == CONFIG_INTERFACE;
         let usage_ok = d.usage_page() == USAGE_PAGE_VENDOR;
-        (!iface_ok, !usage_ok)
+        if !(iface_ok || usage_ok) {
+            continue;
+        }
+        let path = d.path().to_string_lossy().into_owned();
+        if candidates.iter().any(|c| c.path == path) {
+            continue;
+        }
+        let Some(mode) = ConnectionMode::from_vid(vid) else {
+            continue;
+        };
+        candidates.push(DeviceInfo {
+            mode,
+            path,
+            product: d.product_string().unwrap_or("YJX-CHIP").to_string(),
+        });
+    }
+
+    candidates.sort_by_key(|c| {
+        let wired_rank = match c.mode {
+            ConnectionMode::Wired => 0u8,
+            ConnectionMode::Receiver24G => 1u8,
+        };
+        (wired_rank, c.path.clone())
     });
-
-    let d = candidates
-        .into_iter()
-        .find(|d| d.interface_number() == CONFIG_INTERFACE || d.usage_page() == USAGE_PAGE_VENDOR)
-        .ok_or(DeviceError::NotFound)?;
-
-    let mode = ConnectionMode::from_vid(d.vendor_id()).ok_or(DeviceError::NotFound)?;
-    Ok(DeviceInfo {
-        mode,
-        path: d.path().to_string_lossy().into_owned(),
-        product: d.product_string().unwrap_or("YJX-CHIP").to_string(),
-    })
+    candidates
 }
 
 fn open_by_path(api: &HidApi, path: &str) -> Result<HidDevice, DeviceError> {
@@ -298,6 +471,18 @@ fn send_apply(device: &HidDevice, profile: &Profile) -> Result<(), DeviceError> 
         // Official driver waits for the 0xAA echo before the next OUT.
         // Soft-timeout: some hosts drop echoes; still proceed like the previous TUI.
         let _ = wait_for_cmd(device, pkt[1], Duration::from_millis(150), None);
+    }
+    Ok(())
+}
+
+fn send_open_prelude(
+    device: &HidDevice,
+    evt_tx: &Sender<DeviceToHost>,
+) -> Result<(), DeviceError> {
+    for pkt in build_open_prelude() {
+        write_report(device, &pkt)?;
+        // Soft-wait for echo; forward any interleaved battery/stage FA.
+        let _ = wait_for_cmd(device, pkt[1], Duration::from_millis(120), Some(evt_tx));
     }
     Ok(())
 }
@@ -349,13 +534,17 @@ fn wait_for_cmd(
         match device.read_timeout(&mut buf, ms.max(1)) {
             Ok(n) if n > 0 => {
                 let report = normalize_read(&buf[..n]);
-                if report[0] == MAGIC_IN && report[1] == cmd {
-                    return Ok(report);
-                }
+                // Forward side-channel parses for BOTH matched replies and
+                // interleaved FA/etc. Matching GET `0x30` carries battery in
+                // [8]/[9] — if we only return it, the UI never sees charging
+                // on cable (FA 0xD0 is mostly a 2.4G path).
                 if let Some(tx) = evt_tx {
                     if let Some(ev) = parse_inbound(&report) {
                         let _ = tx.send(DeviceToHost::Event(ev));
                     }
+                }
+                if report[0] == MAGIC_IN && report[1] == cmd {
+                    return Ok(report);
                 }
             }
             Ok(_) => {}

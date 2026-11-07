@@ -1,7 +1,5 @@
-//! Smailwolf RS7 — TUI de configuração HID (Linux).
+//! Smailwolf RS7 — TUI HID configurator.
 
-mod device;
-mod protocol;
 mod ui;
 
 use std::io;

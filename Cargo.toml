@@ -1,20 +1,22 @@
-[package]
-name = "rs7-tui"
+[workspace]
+resolver = "2"
+members = [
+    "crates/rs7-core",
+    "crates/rs7-tui",
+]
+# makepkg clones into packaging/aur/*/src — keep that tree out of this workspace
+exclude = ["packaging"]
+default-members = ["crates/rs7-tui"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "TUI configurator for Smailwolf RS7 gaming mouse (YJX HID protocol)"
 license = "MIT OR Apache-2.0"
-readme = "README.md"
 
-[dependencies]
+[workspace.dependencies]
+rs7-core = { path = "crates/rs7-core", version = "0.1.0" }
 crossterm = "0.29.0"
 hidapi = "2.6.6"
 ratatui = "0.30.2"
 thiserror = "2.0.18"
-
-[dev-dependencies]
 pretty_assertions = "1.4.1"
-
-[[example]]
-name = "enum_hid"
-path = "examples/enum_hid.rs"
